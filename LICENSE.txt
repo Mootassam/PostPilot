@@ -1,0 +1,29 @@
+PostPilot — Social Media Scheduler
+End-User License & Terms of Use
+
+1. What PostPilot is
+PostPilot is a desktop application that runs on your computer. It publishes to social networks through
+each network's OFFICIAL API, using developer keys and logins that you create and own. Your posts, media,
+analytics and encrypted logins are stored only on this computer.
+
+2. Your responsibility
+You are responsible for the content you publish and for following the Terms of Service, developer
+policies and community rules of every network you connect (Meta, X, LinkedIn, Google/YouTube, Pinterest,
+Telegram, Bluesky, Mastodon servers, Discord) and the laws of your country. Do not use PostPilot to
+publish spam, scams, illegal or harmful content.
+
+3. Networks and limits
+Each network decides what its API allows (post types, rate limits, paid tiers, app review). PostPilot
+cannot bypass these limits. Some features (for example YouTube uploads from unverified apps) are
+restricted by the network itself.
+
+4. Optional services
+The AI assistant only contacts an AI provider when you configure one (your own Anthropic API key, or a
+local Ollama install). For Instagram/Threads media, PostPilot can open a temporary Cloudflare quick-tunnel
+link while a post is being published; only the one-time media links are reachable through it.
+
+5. No warranty
+PostPilot is provided "as is", without warranty of any kind. In no event shall the authors be liable
+for any claim, damages, lost accounts, lost profits or other liability arising from its use.
+
+By clicking "I accept the agreement" you confirm that you have read and agree to these terms.
