@@ -44,22 +44,45 @@ class AIError(Exception):
     pass
 
 
-def provider() -> str:
+def provider(wait: bool = True) -> str:
     p = store.get("ai_provider") or "auto"
     if p == "off":
         return "off"
     if p in ("anthropic", "auto") and store.get_secret("anthropic_key"):
         return "anthropic"
-    if p in ("ollama", "auto") and ollama_ok():
+    if p in ("ollama", "auto") and ollama_ok(wait=wait):
         return "ollama"
     return "basic"
 
 
-def ollama_ok() -> bool:
+_OLLAMA = {"at": 0.0, "ok": False, "busy": False}
+
+
+def _ollama_probe() -> bool:
     try:
         return requests.get("http://127.0.0.1:11434/api/tags", timeout=1.5).ok
     except requests.RequestException:
         return False
+
+
+def ollama_ok(wait: bool = True) -> bool:
+    """Is local Ollama running? Remembered for a minute. wait=False (the status the UI asks every few seconds) never
+    blocks: it answers from memory and checks again in the background."""
+    import threading
+    import time as _t
+    fresh = _t.time() - _OLLAMA["at"] < 60
+    if wait and not fresh:
+        _OLLAMA.update(ok=_ollama_probe(), at=_t.time())
+    elif not fresh and not _OLLAMA["busy"]:
+        _OLLAMA["busy"] = True
+
+        def bg():
+            try:
+                _OLLAMA.update(ok=_ollama_probe(), at=_t.time())
+            finally:
+                _OLLAMA["busy"] = False
+        threading.Thread(target=bg, daemon=True, name="ollama-check").start()
+    return _OLLAMA["ok"]
 
 
 def _prompt(task: str, text: str, network: str, tone: str, lang: str, extra: str) -> str:

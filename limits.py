@@ -33,12 +33,13 @@ X_PLANS = {
 }
 
 
-def rules(network: str) -> list[tuple[int, int, str]]:
+def rules(network: str, brand_id: int | None = None) -> list[tuple[int, int, str]]:
     over = store.jd(store.get("limits")).get(network)
     if over:
         return [(int(n), int(w), f"Your limit: {int(n)} posts per {window_label(int(w))}") for n, w in over]
-    if network == "x":
-        return X_PLANS.get(store.get("x_plan") or "free", X_PLANS["free"])
+    if network == "x":   # each brand can have its own X plan (its own developer account)
+        plan = store.bget(brand_id or store.get("brand_id"), "x_plan")
+        return X_PLANS.get(plan or "free", X_PLANS["free"])
     return DEFAULTS.get(network, [])
 
 
@@ -65,7 +66,7 @@ def wait_until(account: dict, needed: int = 1) -> tuple[int | None, str]:
     rl = store.jd(account.get("rl"))
     if rl.get("remaining") == 0 and rl.get("reset", 0) > now:
         return int(rl["reset"]) + 5, rl.get("label") or "The network says your posting limit is used up"
-    for limit, window, label in rules(account["network"]):
+    for limit, window, label in rules(account["network"], store.brand_of_account(account)):
         if used(account["id"], window, now) + needed > limit:
             # the moment enough old posts leave the window
             rows = store.rows("SELECT COALESCE(sent_at,published_at) published_at, COALESCE(units,1) u FROM targets WHERE account_id=?"
@@ -84,7 +85,7 @@ def wait_until(account: dict, needed: int = 1) -> tuple[int | None, str]:
 
 def usage(account: dict) -> list[dict]:
     out = []
-    for limit, window, label in rules(account["network"]):
+    for limit, window, label in rules(account["network"], store.brand_of_account(account)):
         out.append({"limit": limit, "window": window, "window_label": window_label(window), "used": used(account["id"], window), "label": label})
     return out
 
@@ -92,7 +93,7 @@ def usage(account: dict) -> list[dict]:
 def forecast(account: dict, ts: int, extra: int = 1, exclude_post: int | None = None) -> list[str]:
     """Warnings for scheduling one more post at `ts` (counts already scheduled + published posts in each window)."""
     warns = []
-    for limit, window, label in rules(account["network"]):
+    for limit, window, label in rules(account["network"], store.brand_of_account(account)):
         if window < HOUR:
             continue
         q = ("SELECT COUNT(*) FROM targets t JOIN posts p ON p.id=t.post_id WHERE t.account_id=? AND ((t.status IN ('pending','publishing')"

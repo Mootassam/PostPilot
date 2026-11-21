@@ -192,8 +192,8 @@ class YouTube(Connector):
     def _fresh(self, account, creds):
         if creds.get("token_exp", 0) > time.time() + 120:
             return creds["token"]
-        from store import app_creds, save_creds
-        app = app_creds("youtube")
+        from store import account_app, save_creds
+        app = account_app(account, "youtube")
         d = net.post_json("https://oauth2.googleapis.com/token", data={"client_id": app.get("client_id"), "client_secret": app.get("client_secret"),
                                                                        "refresh_token": creds.get("refresh"), "grant_type": "refresh_token"},
                           auth_statuses=(400, 401))  # invalid_grant = login revoked/expired
@@ -222,9 +222,7 @@ class YouTube(Connector):
         r = net.request("POST", "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
                         headers={"Authorization": f"Bearer {tok}", "X-Upload-Content-Type": v["mime"], "X-Upload-Content-Length": str(size)},
                         json=meta)
-        loc = r.headers["Location"]
-        with open(v["path"], "rb") as f:
-            d = net.request("PUT", loc, data=f, headers={"Content-Type": v["mime"], "Content-Length": str(size)}, timeout=(15, 3600)).json()
+        d = resumable_upload(r.headers["Location"], v["path"], v["mime"], size)
         return {"remote_id": d["id"], "url": f"https://youtu.be/{d['id']}"}
 
     def metrics(self, account, creds, remote_id):
@@ -233,6 +231,50 @@ class YouTube(Connector):
                           headers={"Authorization": f"Bearer {tok}"}).get("items") or [{}]
         s = it[0].get("statistics", {})
         return {"views": int(s.get("viewCount", 0)), "likes": int(s.get("likeCount", 0)), "comments": int(s.get("commentCount", 0))}
+
+
+CHUNK = 16 * 1024 * 1024          # multiple of 256 KB, as Google requires
+
+
+def resumable_upload(loc: str, path: str, mime: str, size: int, tries: int = 8) -> dict:
+    """Send a big video in 16 MB pieces. If the connection drops, ask Google how much arrived and go on
+    from there (no restart from zero), up to `tries` interruptions."""
+    import time as _t
+    pos, fails = 0, 0
+    with open(path, "rb") as f:
+        while True:
+            if pos >= size:  # everything sent but no final answer yet: ask for it
+                r = _status(loc, size)
+                if r is not None and r.status_code in (200, 201):
+                    return r.json()
+            f.seek(pos)
+            piece = f.read(min(CHUNK, size - pos))
+            end = pos + len(piece) - 1
+            try:
+                r = net.request("PUT", loc, data=piece, ok=(200, 201, 308), timeout=(15, 900),
+                                headers={"Content-Type": mime, "Content-Length": str(len(piece)), "Content-Range": f"bytes {pos}-{end}/{size}"})
+            except net.PublishError as e:
+                if e.kind != "transient" or fails >= tries:
+                    raise
+                fails += 1
+                _t.sleep(min(60, 3 * 2 ** fails))
+                r = _status(loc, size)          # where did Google stop?
+                if r is None:
+                    continue
+            if r.status_code in (200, 201):
+                return r.json()
+            rng = r.headers.get("Range") or ""  # "bytes=0-16777215" = what Google has
+            pos = int(rng.rsplit("-", 1)[1]) + 1 if "-" in rng else 0
+
+
+def _status(loc: str, size: int):
+    try:
+        return net.request("PUT", loc, data=b"", ok=(200, 201, 308), timeout=(15, 60),
+                           headers={"Content-Length": "0", "Content-Range": f"bytes */{size}"})
+    except net.PublishError as e:
+        if e.kind == "transient":
+            return None
+        raise
 
 
 # ================================================================== Reminder mode

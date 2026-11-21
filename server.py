@@ -41,7 +41,7 @@ import store  # noqa: E402
 import tunnel  # noqa: E402
 from net import PublishError  # noqa: E402
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 DEFAULT_PORT = 5088
 FAKE = os.environ.get("PP_FAKE") == "1"
 
@@ -193,16 +193,19 @@ def status():
                                      (bid, store.now() + 7 * 86400), 0),
         },
         notifications=notes, last_activity=store.scalar("SELECT MAX(id) FROM activity", (), 0),
-        ai=ai.provider(), tunnel=tunnel.status()["status"])
+        ai=ai.provider(wait=False), tunnel=tunnel.status()["status"],
+        rev=store.REV[0], queue=eng.queue_stats(),
+        due=store.scalar("SELECT COUNT(*) FROM targets t JOIN posts p ON p.id=t.post_id WHERE p.status='scheduled' AND p.scheduled_at<=?"
+                         " AND t.status='pending'", (store.now(),), 0))
 
 
 @app.get("/api/dashboard")
 def dashboard():
     bid = brand_id()
     now = store.now()
-    upcoming = [post_out(p) for p in store.rows("SELECT * FROM posts WHERE brand_id=? AND status='scheduled' ORDER BY scheduled_at LIMIT 8", (bid,))]
-    recent = [post_out(p) for p in store.rows("SELECT * FROM posts WHERE brand_id=? AND status IN ('published','partial','failed')"
-                                              " ORDER BY published_at DESC LIMIT 6", (bid,))]
+    upcoming = posts_out(store.rows("SELECT * FROM posts WHERE brand_id=? AND status='scheduled' ORDER BY scheduled_at LIMIT 8", (bid,)))
+    recent = posts_out(store.rows("SELECT * FROM posts WHERE brand_id=? AND status IN ('published','partial','failed')"
+                                  " ORDER BY published_at DESC LIMIT 6", (bid,)))
     week = store.one("SELECT COUNT(*) n FROM targets t JOIN posts p ON p.id=t.post_id WHERE p.brand_id=? AND t.status='published' AND t.published_at>=?",
                      (bid, now - 7 * 86400))["n"]
     eng7 = {"likes": 0, "comments": 0, "shares": 0, "views": 0}
@@ -212,13 +215,16 @@ def dashboard():
             eng7[k] += int(m.get(k) or 0)
     days = []
     start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    t0, t7 = int(start.timestamp()), int((start + timedelta(days=7)).timestamp())
+    per = {}
+    for r in store.rows("SELECT scheduled_at FROM posts WHERE brand_id=? AND status='scheduled' AND scheduled_at>=? AND scheduled_at<?", (bid, t0, t7)):
+        k = datetime.fromtimestamp(r["scheduled_at"]).strftime("%Y-%m-%d")
+        per[k] = per.get(k, 0) + 1
     for i in range(7):
         d0 = start + timedelta(days=i)
-        n = store.scalar("SELECT COUNT(*) FROM posts WHERE brand_id=? AND status='scheduled' AND scheduled_at>=? AND scheduled_at<?",
-                         (bid, int(d0.timestamp()), int((d0 + timedelta(days=1)).timestamp())), 0)
-        days.append({"day": d0.strftime("%a"), "date": d0.strftime("%d"), "n": n})
+        days.append({"day": d0.strftime("%a"), "date": d0.strftime("%d"), "n": per.get(d0.strftime("%Y-%m-%d"), 0)})
     return jsonify(upcoming=upcoming, recent=recent, published_7d=week, engagement_30d=eng7, week=days,
-                   accounts=[account_out(a) for a in store.rows("SELECT * FROM accounts WHERE brand_id=? ORDER BY network, name", (bid,))],
+                   accounts=accounts_out(store.rows("SELECT * FROM accounts WHERE brand_id=? ORDER BY network, name", (bid,))),
                    activity=store.rows("SELECT * FROM activity ORDER BY id DESC LIMIT 10"))
 
 
@@ -259,8 +265,11 @@ def brands_delete(bid):
         raise ValueError("You need at least one brand.")
     for p in store.rows("SELECT id FROM posts WHERE brand_id=?", (bid,)):
         store.execute("DELETE FROM targets WHERE post_id=?", (p["id"],))
-    for t in ("posts", "accounts", "ideas", "hashtag_groups", "templates", "feeds"):
+    for t in ("posts", "accounts", "ideas", "hashtag_groups", "templates", "feeds", "plans", "brand_apps"):
         store.execute(f"DELETE FROM {t} WHERE brand_id=?", (bid,))
+    store.execute("DELETE FROM settings WHERE key LIKE ?", (f"b{bid}:%",))
+    for m in store.rows("SELECT id FROM media WHERE brand_id=?", (bid,)):
+        media_mod.delete(m["id"])
     store.execute("DELETE FROM brands WHERE id=?", (bid,))
     brand_id()
     return ok()
@@ -274,11 +283,20 @@ def account_out(a: dict) -> dict:
             "abbr": c.abbr if c else "?", "name": a["name"], "handle": a["handle"], "avatar": a["avatar"], "status": a["status"],
             "error": a["error"], "expires_at": a["expires_at"], "slots": store.jl(a["slots"]) if a["slots"] else None,
             "boards": extra.get("boards"), "board_id": extra.get("board_id"), "app": extra.get("app"),
-            "posts": store.scalar("SELECT COUNT(*) FROM targets WHERE account_id=? AND status='published'", (a["id"],), 0),
+            "posts": a["_posts"] if "_posts" in a else store.scalar("SELECT COUNT(*) FROM targets WHERE account_id=? AND status='published'", (a["id"],), 0),
             "last_check_at": a.get("last_check_at"), "check_error": a.get("check_error") or "",
             "inbox": bool(c and c.inbox), "inbox_error": a.get("inbox_error") or "", "inbox_synced_at": a.get("inbox_synced_at"),
             "auto_renew": a["network"] in ("threads", "pinterest", "youtube") and bool(a["expires_at"] is not None or a["network"] == "youtube"),
             "usage": limits.usage(a)}
+
+
+def accounts_out(rows: list[dict]) -> list[dict]:
+    if rows:
+        ids = [a["id"] for a in rows]
+        cnt = {r["account_id"]: r["n"] for r in store.rows(
+            f"SELECT account_id, COUNT(*) n FROM targets WHERE status='published' AND account_id IN ({','.join('?' * len(ids))}) GROUP BY account_id", ids)}
+        rows = [{**a, "_posts": cnt.get(a["id"], 0)} for a in rows]
+    return [account_out(a) for a in rows]
 
 
 @app.get("/api/networks")
@@ -288,7 +306,7 @@ def networks():
         m = c.meta()
         m["guide"] = [g.replace("{redirect}", redirect_uri()) for g in m["guide"]]
         m["app_key"] = connectors.app_key(c.key)
-        app_c = store.app_creds(m["app_key"])
+        app_c = store.app_creds(m["app_key"], brand_id())
         m["app_saved"] = {f["key"]: (bool(app_c.get(f["key"])) if f.get("secret") else app_c.get(f["key"], "")) for f in c.app_fields}
         out.append(m)
     return jsonify(networks=out, redirect=redirect_uri())
@@ -296,12 +314,13 @@ def networks():
 
 @app.get("/api/accounts")
 def accounts_list():
-    return jsonify(accounts=[account_out(a) for a in store.rows("SELECT * FROM accounts WHERE brand_id=? ORDER BY network, name", (brand_id(),))],
-                   default_slots=store.jl(store.get("default_slots")))
-
-
-def _add_accounts(found: list[dict]) -> list[int]:
     bid = brand_id()
+    return jsonify(accounts=accounts_out(store.rows("SELECT * FROM accounts WHERE brand_id=? ORDER BY network, name", (bid,))),
+                   default_slots=store.jl(store.bget(bid, "default_slots")), brand_id=bid)
+
+
+def _add_accounts(found: list[dict], bid: int | None = None) -> list[int]:
+    bid = bid or brand_id()
     ids = []
     for f in found:
         ex = store.one("SELECT * FROM accounts WHERE brand_id=? AND network=? AND external_id=? AND external_id<>''",
@@ -318,21 +337,26 @@ def _add_accounts(found: list[dict]) -> list[int]:
                                 " VALUES(?,?,?,?,?,?,?,?,?,?,?)", (bid, f["network"], f["name"] or f["network"], f.get("handle", ""),
                                                                     f.get("avatar", ""), f.get("external_id", ""), "ok", f.get("expires_at"),
                                                                     json.dumps(extra), store.now(), store.now()))
-        store.save_creds(aid, f["creds"])
+        creds = dict(f["creds"])
+        app_c = store.app_creds(connectors.app_key(f["network"]), bid)
+        if app_c:
+            creds["_app"] = app_c       # remember the app this login belongs to (token renewal uses exactly this one)
+        store.save_creds(aid, creds)
         store.log("accounts", f"Connected {connectors.get(f['network']).name}: {f['name']}", "good")
         ids.append(aid)
     return ids
 
 
-def _offer(found: list[dict]):
+def _offer(found: list[dict], bid: int | None = None):
     """One account → add it. Several (Meta pages + Instagram…) → let the user pick."""
+    bid = bid or brand_id()
     if len(found) == 1:
-        return ok(added=_add_accounts(found))
+        return ok(added=_add_accounts(found, bid))
     tok = secrets.token_urlsafe(12)
-    PENDING[tok] = {"found": found, "ts": time.time()}
+    PENDING[tok] = {"found": found, "ts": time.time(), "brand_id": bid}
     return ok(pending=tok, choices=[{"i": i, "network": f["network"], "name": f["name"], "handle": f.get("handle", ""), "avatar": f.get("avatar", ""),
                                      "exists": bool(store.one("SELECT 1 FROM accounts WHERE brand_id=? AND network=? AND external_id=?",
-                                                              (brand_id(), f["network"], f.get("external_id", ""))))}
+                                                              (bid, f["network"], f.get("external_id", ""))))}
                                     for i, f in enumerate(found)])
 
 
@@ -340,7 +364,9 @@ def _offer(found: list[dict]):
 def accounts_connect():
     b = body()
     c = connectors.get(b.get("network", ""))
-    return _offer(c.connect_form(b.get("data") or {}))
+    data = dict(b.get("data") or {})
+    data["_app"] = store.app_creds(connectors.app_key(c.key), brand_id())
+    return _offer(c.connect_form(data))
 
 
 @app.post("/api/accounts/pick")
@@ -353,19 +379,89 @@ def accounts_pick():
     found = [f for i, f in enumerate(p["found"]) if i in picks]
     if not found:
         raise ValueError("Pick at least one account.")
-    return ok(added=_add_accounts(found))
+    return ok(added=_add_accounts(found, p.get("brand_id")))
+
+
+def _app_groups() -> list[dict]:
+    """Developer apps by app key (Facebook + Instagram share one Meta app)."""
+    groups: dict[str, dict] = {}
+    for c in connectors.ORDER:
+        if not c.app_fields:
+            continue
+        k = connectors.app_key(c.key)
+        g = groups.setdefault(k, {"key": k, "networks": [], "fields": c.app_fields, "color": c.color, "abbr": c.abbr,
+                                  "guide": [x.replace("{redirect}", redirect_uri()) for x in c.guide]})
+        g["networks"].append(c.name)
+    return list(groups.values())
+
+
+@app.get("/api/brand")
+def brand_get():
+    bid = brand_id()
+    br = store.one("SELECT * FROM brands WHERE id=?", (bid,))
+    apps = []
+    for g in _app_groups():
+        cur = store.app_creds(g["key"], bid)
+        nets = [c.key for c in connectors.ORDER if connectors.app_key(c.key) == g["key"]]
+        apps.append({**g, "saved": {f["key"]: (bool(cur.get(f["key"])) if f.get("secret") else cur.get(f["key"], "")) for f in g["fields"]},
+                     "complete": all(cur.get(f["key"]) for f in g["fields"]),
+                     "accounts": store.scalar(f"SELECT COUNT(*) FROM accounts WHERE brand_id=? AND network IN ({','.join('?' * len(nets))})", (bid, *nets), 0)})
+    others = []
+    for o in store.rows("SELECT id, name, color FROM brands WHERE id<>? ORDER BY id", (bid,)):
+        keys = [r["network"] for r in store.rows("SELECT network FROM brand_apps WHERE brand_id=? AND creds<>''", (o["id"],))]
+        others.append({**o, "apps": keys})
+    return jsonify(brand=br, apps=apps, others=others, redirect=redirect_uri(),
+                   settings={k: store.bget(bid, k) for k in ("utm_source", "utm_medium", "utm_campaign", "x_plan", "native_schedule")},
+                   default_slots=store.jl(store.bget(bid, "default_slots")),
+                   counts={"accounts": store.scalar("SELECT COUNT(*) FROM accounts WHERE brand_id=?", (bid,), 0),
+                           "scheduled": store.scalar("SELECT COUNT(*) FROM posts WHERE brand_id=? AND status='scheduled'", (bid,), 0),
+                           "media": store.scalar("SELECT COUNT(*) FROM media WHERE brand_id=?", (bid,), 0)})
+
+
+@app.post("/api/brand/apps/<app_key>")
+def brand_app_save(app_key):
+    g = next((x for x in _app_groups() if x["key"] == app_key), None)
+    if not g:
+        raise ValueError("Unknown app.")
+    b = body()
+    bid = brand_id()
+    if b.get("clear"):
+        store.execute("DELETE FROM brand_apps WHERE brand_id=? AND network=?", (bid, app_key))
+        return ok()
+    cur = store.app_creds(app_key, bid)
+    for f in g["fields"]:
+        v = (b.get(f["key"]) or "").strip()
+        if v:
+            cur[f["key"]] = v
+    store.set_app_creds(app_key, cur, bid)
+    return ok()
+
+
+@app.post("/api/brand/apps-copy")
+def brand_apps_copy():
+    src = int(body().get("from") or 0)
+    bid = brand_id()
+    if not src or src == bid or not store.one("SELECT 1 FROM brands WHERE id=?", (src,)):
+        raise ValueError("Pick another brand to copy from.")
+    n = 0
+    for r in store.rows("SELECT network, creds FROM brand_apps WHERE brand_id=?", (src,)):
+        store.execute("INSERT INTO brand_apps(brand_id,network,creds,updated_at) VALUES(?,?,?,?) ON CONFLICT(brand_id,network)"
+                      " DO UPDATE SET creds=excluded.creds, updated_at=excluded.updated_at", (bid, r["network"], r["creds"], store.now()))
+        n += 1
+    return ok(copied=n)
 
 
 @app.post("/api/apps/<network>")
 def apps_save(network):
     c = connectors.get(network)
     key = connectors.app_key(network)
-    cur = store.app_creds(key)
+    bid = brand_id()
+    cur = store.app_creds(key, bid)
     for f in c.app_fields:
         v = (body().get(f["key"]) or "").strip()
         if v:
             cur[f["key"]] = v
-    store.set_app_creds(key, cur)
+    store.set_app_creds(key, cur, bid)
     return ok()
 
 
@@ -374,8 +470,9 @@ def oauth_start():
     network = body().get("network", "")
     c = connectors.get(network)
     state = secrets.token_urlsafe(16)
-    PENDING["oauth:" + state] = {"network": network, "ts": time.time()}
-    return ok(url=c.oauth_url(store.app_creds(connectors.app_key(network)), redirect_uri(), state), state=state)
+    bid = brand_id()
+    PENDING["oauth:" + state] = {"network": network, "ts": time.time(), "brand_id": bid}
+    return ok(url=c.oauth_url(store.app_creds(connectors.app_key(network), bid), redirect_uri(), state), state=state)
 
 
 @app.get("/oauth/callback")
@@ -391,7 +488,7 @@ def oauth_callback():
     else:
         try:
             c = connectors.get(p["network"])
-            found = c.oauth_finish(store.app_creds(connectors.app_key(p["network"])), redirect_uri(), request.args.get("code", ""))
+            found = c.oauth_finish(store.app_creds(connectors.app_key(p["network"]), p.get("brand_id")), redirect_uri(), request.args.get("code", ""))
             p["result"] = {"found": found}
             msg = "Connected! You can close this window and go back to PostPilot."
         except PublishError as e:
@@ -417,7 +514,7 @@ def oauth_result():
     PENDING.pop("oauth:" + state, None)
     if r.get("error"):
         return jsonify(status="error", error=r["error"])
-    resp = _offer(r["found"]).get_json()
+    resp = _offer(r["found"], p.get("brand_id")).get_json()
     return jsonify(status="done", **resp)
 
 
@@ -445,6 +542,8 @@ def accounts_update(aid):
         store.execute("UPDATE accounts SET extra=? WHERE id=?", (json.dumps(extra), aid))
     if "paused" in b:
         store.execute("UPDATE accounts SET status=? WHERE id=?", ("paused" if b["paused"] else "ok", aid))
+        if not b["paused"]:
+            store.execute("UPDATE targets SET next_try_at=NULL, error='', limit_note='' WHERE account_id=? AND status='pending' AND limit_note='paused'", (aid,))
     return ok()
 
 
@@ -460,19 +559,32 @@ def default_slots():
     slots = body().get("slots") or []
     for s in slots:
         datetime.strptime(s["time"], "%H:%M")
-    store.set("default_slots", json.dumps(sorted(slots, key=lambda x: x["time"])))
+    store.bset(brand_id(), "default_slots", json.dumps(sorted(slots, key=lambda x: x["time"])))   # each brand has its own times
     return ok()
 
 
 # ------------------------------------------------------------------ media library
 @app.get("/api/media")
 def media_list():
-    q = (request.args.get("q") or "").lower()
-    rows = store.rows("SELECT * FROM media WHERE brand_id=? ORDER BY id DESC LIMIT 500", (brand_id(),))
-    out = [media_mod.out(m) for m in rows if not q or q in m["name"].lower() or q in (m["alt"] or "").lower() or q in (m["tags"] or "").lower()]
+    bid = brand_id()
+    q = (request.args.get("q") or "").strip()
+    kind = request.args.get("kind") or ""
+    limit = max(1, min(1000, int(request.args.get("limit") or 300)))
+    offset = max(0, int(request.args.get("offset") or 0))
+    sql, args = " FROM media WHERE brand_id=?", [bid]
+    if q:
+        sql += " AND (name LIKE ? OR alt LIKE ? OR tags LIKE ?)"
+        args += [f"%{q}%"] * 3
+    if kind in ("image", "video", "gif"):
+        sql += " AND kind=?"
+        args.append(kind)
+    total = store.scalar("SELECT COUNT(*)" + sql, args, 0)
+    rows = store.rows("SELECT *" + sql + " ORDER BY id DESC LIMIT ? OFFSET ?", args + [limit, offset])
+    used = media_mod.usage_counts(bid)
+    out = [media_mod.out(m) for m in rows]
     for m in out:
-        m["used"] = store.scalar("SELECT COUNT(*) FROM posts WHERE media LIKE ?", (f"%{m['id']}%",), 0)
-    return jsonify(media=out)
+        m["used"] = used.get(m["id"], 0)
+    return jsonify(media=out, total=total, has_more=offset + len(out) < total)
 
 
 @app.post("/api/media")
@@ -485,7 +597,7 @@ def media_upload():
         tmp = os.path.join(tempfile.gettempdir(), f"pp-up-{uuid.uuid4().hex}")
         f.save(tmp)
         try:
-            out.append(media_mod.out(media_mod.save_file(tmp, f.filename or "file", brand_id(), move=True)))
+            out.append(media_mod.out(media_mod.save_file(tmp, f.filename or "file", brand_id(), move=True, thumb_async=True)))
         except ValueError as e:
             errors.append(str(e))
         finally:
@@ -514,23 +626,48 @@ def media_delete(mid):
 
 
 # ------------------------------------------------------------------ posts
+def _in_chunks(ids: list, sql: str, extra=()) -> list[dict]:
+    """SELECT … WHERE x IN (ids) in chunks (SQLite allows ~900 parameters per query)."""
+    out = []
+    ids = list(ids)
+    for i in range(0, len(ids), 800):
+        part = ids[i:i + 800]
+        out += store.rows(sql.replace("(?)", "(" + ",".join("?" * len(part)) + ")"), (*part, *extra))
+    return out
+
+
+def posts_out(rows: list[dict]) -> list[dict]:
+    """Many posts at once with 2 queries in total (targets + media), not 2 per post — fast with hundreds of posts."""
+    if not rows:
+        return []
+    pids = [p["id"] for p in rows]
+    by_post: dict[int, list] = {}
+    for t in _in_chunks(pids, "SELECT t.*, a.network, a.name account_name, a.avatar, a.handle FROM targets t LEFT JOIN accounts a ON a.id=t.account_id"
+                                  " WHERE t.post_id IN (?) ORDER BY t.id"):
+        by_post.setdefault(t["post_id"], []).append(t)
+    media_ids = {int(i) for p in rows for i in store.jl(p["media"]) if str(i).lstrip("-").isdigit()}
+    media = {m["id"]: media_mod.out(m) for m in _in_chunks(sorted(media_ids), "SELECT * FROM media WHERE id IN (?)")} if media_ids else {}
+    out = []
+    for p in rows:
+        d = dict(p)
+        for k in ("media", "labels"):
+            d[k] = store.jl(p[k])
+        d["recurring"] = store.jd(p["recurring"])
+        d["media_items"] = [media[int(i)] for i in d["media"] if str(i).lstrip("-").isdigit() and int(i) in media]
+        out_t = []
+        for t in by_post.get(p["id"], []):
+            c = connectors.REGISTRY.get(t["network"] or "")
+            out_t.append({"id": t["id"], "account_id": t["account_id"], "network": t["network"], "account_name": t["account_name"] or "(removed)",
+                          "avatar": t["avatar"], "color": c.color if c else "#999", "abbr": c.abbr if c else "?", "status": t["status"],
+                          "url": t["url"], "error": t["error"], "text": t["text"], "options": store.jd(t["options"]),
+                          "metrics": store.jd(t["metrics"]), "published_at": t["published_at"], "attempts": t["attempts"], "next_try_at": t["next_try_at"]})
+        d["targets"] = out_t
+        out.append(d)
+    return out
+
+
 def post_out(p: dict, full: bool = False) -> dict:
-    d = dict(p)
-    for k in ("media", "labels"):
-        d[k] = store.jl(p[k])
-    d["recurring"] = store.jd(p["recurring"])
-    d["media_items"] = [media_mod.out(m) for m in (store.one("SELECT * FROM media WHERE id=?", (i,)) for i in d["media"]) if m]
-    ts = store.rows("SELECT t.*, a.network, a.name account_name, a.avatar, a.handle FROM targets t LEFT JOIN accounts a ON a.id=t.account_id"
-                    " WHERE t.post_id=? ORDER BY t.id", (p["id"],))
-    out_t = []
-    for t in ts:
-        c = connectors.REGISTRY.get(t["network"] or "")
-        out_t.append({"id": t["id"], "account_id": t["account_id"], "network": t["network"], "account_name": t["account_name"] or "(removed)",
-                      "avatar": t["avatar"], "color": c.color if c else "#999", "abbr": c.abbr if c else "?", "status": t["status"],
-                      "url": t["url"], "error": t["error"], "text": t["text"], "options": store.jd(t["options"]),
-                      "metrics": store.jd(t["metrics"]), "published_at": t["published_at"], "attempts": t["attempts"], "next_try_at": t["next_try_at"]})
-    d["targets"] = out_t
-    return d
+    return posts_out([p])[0]
 
 
 @app.get("/api/posts")
@@ -555,9 +692,13 @@ def posts_list():
     if acc:
         sql += " AND id IN (SELECT post_id FROM targets WHERE account_id=?)"
         args.append(int(acc))
-    order = "scheduled_at" if st == "scheduled" else "COALESCE(published_at, scheduled_at, updated_at) DESC"
-    sql += f" ORDER BY {order} LIMIT 500"
-    return jsonify(posts=[post_out(p) for p in store.rows(sql, args)])
+    order = "scheduled_at, id" if st == "scheduled" else "COALESCE(published_at, scheduled_at, updated_at) DESC, id DESC"
+    calendar = bool(f and t)
+    limit = max(1, min(3000 if calendar else 500, int(request.args.get("limit") or (3000 if calendar else 100))))
+    offset = max(0, int(request.args.get("offset") or 0))
+    total = store.scalar("SELECT COUNT(*) FROM (" + sql + ")", args, 0)
+    rows = store.rows(sql + f" ORDER BY {order} LIMIT ? OFFSET ?", args + [limit, offset])
+    return jsonify(posts=posts_out(rows), total=total, has_more=offset + len(rows) < total, offset=offset)
 
 
 @app.get("/api/posts/<int:pid>")
@@ -618,7 +759,7 @@ def posts_save():
     elif action == "now":
         when = store.now()
     elif action == "queue":
-        when = engine_mod.next_free_slot([t["account_id"] for t in targets], exclude_post=int(b["id"]) if b.get("id") else None)
+        when = engine_mod.next_free_slot([t["account_id"] for t in targets], exclude_post=int(b["id"]) if b.get("id") else None, brand_id=brand_id())
     status = "draft" if action == "draft" else "scheduled"
     rec = b.get("recurring") or {}
     rec = json.dumps({"every_days": float(rec.get("every_days")), "times": int(rec.get("times") or 0), "done": 0}) \
@@ -646,6 +787,164 @@ def posts_save():
     if action == "now":
         threading.Thread(target=eng.dispatch, daemon=True).start()
     return ok(post=post_out(store.one("SELECT * FROM posts WHERE id=?", (pid,))))
+
+
+def _nice_name(name: str) -> str:
+    base = os.path.splitext(name or "")[0]
+    return " ".join(base.replace("_", " ").replace("-", " ").split()).strip() or "video"
+
+
+def _fill(tpl: str, m: dict, i: int, n: int) -> str:
+    return (tpl or "").replace("{name}", _nice_name(m["name"])).replace("{n}", str(i + 1)).replace("{total}", str(n)).strip()
+
+
+@app.post("/api/posts/bulk")
+def posts_bulk():
+    """One post per media file, for hundreds of files at once: captions/titles from templates ({name} = file name),
+    times from the brand's queue slots or an even spread. Everything is checked first, then written in one go."""
+    b = body()
+    bid = brand_id()
+    mids = [int(x) for x in b.get("media") or []]
+    if not mids:
+        raise ValueError("Select the photos or videos to schedule.")
+    if len(mids) > 2000:
+        raise ValueError("At most 2,000 files at once.")
+    accounts = [a for a in (store.one("SELECT * FROM accounts WHERE id=? AND brand_id=?", (int(x), bid)) for x in b.get("accounts") or []) if a]
+    if not accounts:
+        raise ValueError("Choose at least one account of this brand.")
+    found = {m["id"]: m for m in _in_chunks(mids, "SELECT * FROM media WHERE id IN (?) AND brand_id=?", (bid,))}
+    media = [found[i] for i in mids if i in found]
+    if not media:
+        raise ValueError("Those files are not in this brand's media library.")
+    mode = b.get("mode") or "queue"            # queue | spread | draft
+    caption = b.get("caption") or "{name}"
+    title_tpl = (b.get("title") or "").strip()
+    privacy = b.get("privacy") or ""
+    first_comment = (b.get("first_comment") or "").strip()
+    link = (b.get("link") or "").strip()
+    per_day = max(0, min(100, int(b.get("per_day") or 0)))
+    n = len(media)
+    # 1. check every post for every account before writing anything
+    problems, plan = [], []
+    for i, m in enumerate(media):
+        text = _fill(caption, m, i, n)
+        opts = {}
+        if title_tpl:
+            opts["title"] = _fill(title_tpl, m, i, n)[:100]
+        if privacy in ("public", "unlisted", "private"):
+            opts["privacy"] = privacy
+        tgts = [{"account_id": a["id"], "text": "", "options": opts} for a in accounts]
+        errs = engine_mod.validate_post({"text": text, "media": [m["id"]], "link": link}, tgts)
+        bad = {k: v for k, v in errs.items() if v}
+        if bad:
+            names = {str(a["id"]): a["name"] for a in accounts}
+            problems.append(f"{m['name']}: " + " · ".join(f"{names.get(k, k)}: {' '.join(v)}" for k, v in bad.items()))
+            continue
+        plan.append((m, text, opts))
+    if not plan:
+        raise ValueError("Nothing can be scheduled — " + "; ".join(problems[:5]))
+    # 2. the times
+    acc_ids = [a["id"] for a in accounts]
+    if mode == "draft":
+        times = [None] * len(plan)
+    elif mode == "spread":
+        start = int(b.get("start_at") or 0)
+        every = max(5, int(b.get("every_min") or 60)) * 60
+        if start < store.now() + 60:
+            raise ValueError("Pick a start time in the future.")
+        times, ts, day_key, today = [], start, None, 0
+        for _ in plan:
+            if per_day:
+                k = datetime.fromtimestamp(ts).date()
+                if k != day_key:
+                    day_key, today = k, 0
+                if today >= per_day:   # day is full: same start time on the next day
+                    nxt = datetime.fromtimestamp(start).replace(year=k.year, month=k.month, day=k.day) + timedelta(days=1)
+                    ts, day_key, today = int(nxt.timestamp()), nxt.date(), 0
+                today += 1
+            times.append(ts)
+            ts += every
+    else:
+        after = max(store.now(), int(b.get("start_at") or 0))
+        times = engine_mod.free_slots(acc_ids, len(plan), after=after, brand_id=bid, per_day=per_day)
+    status = "draft" if mode == "draft" else "scheduled"
+    now = store.now()
+    # 3. write everything in ONE transaction (fast, and all-or-nothing)
+    created = []
+    with store.transaction() as c:
+        for (m, text, opts), when in zip(plan, times):
+            cur = c.execute("INSERT INTO posts(brand_id,status,text,media,first_comment,link,utm,labels,scheduled_at,recurring,source,notes,created_at,updated_at)"
+                            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (bid, status, text, json.dumps([m["id"]]), first_comment, link, int(bool(b.get("utm"))),
+                                                                     json.dumps(b.get("labels") or []), when, "", "bulk", "", now, now))
+            pid = cur.lastrowid
+            c.executemany("INSERT INTO targets(post_id,account_id,text,options) VALUES(?,?,?,?)",
+                          [(pid, aid, "", json.dumps(opts)) for aid in acc_ids])
+            created.append(pid)
+    # 4. tell about posting limits (e.g. YouTube ≈ 6 uploads a day: extra ones simply wait their turn)
+    warnings = []
+    if status == "scheduled" and times:
+        for a in accounts:
+            for limit, window, label in limits.rules(a["network"], bid):
+                if window != limits.DAY:
+                    continue
+                per = {}
+                for ts in times:
+                    k = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                    per[k] = per.get(k, 0) + 1
+                worst = max(per.values()) if per else 0
+                if worst > limit:
+                    warnings.append(f"{a['name']}: up to {worst} posts on one day — {label}. The extra ones wait for the next free day automatically.")
+    store.log("bulk", f"Bulk scheduling: {len(created)} post(s) {'saved as drafts' if status == 'draft' else 'scheduled'} for "
+                      f"{len(accounts)} account(s)" + (f", {len(problems)} file(s) skipped" if problems else ""), "good")
+    return ok(created=len(created), ids=created, first=times[0] if times and times[0] else None, last=times[-1] if times and times[-1] else None,
+              problems=problems[:100], warnings=warnings)
+
+
+@app.post("/api/posts/bulk-action")
+def posts_bulk_action():
+    """Delete / move to drafts / retry / publish now / shift many posts at once (posts already handed to a network are left alone)."""
+    b = body()
+    ids = [int(x) for x in b.get("ids") or []][:5000]
+    action = b.get("action")
+    if not ids or action not in ("delete", "unschedule", "retry", "now", "shift"):
+        raise ValueError("Nothing to do.")
+    posts = {p["id"]: p for p in _in_chunks(ids, "SELECT * FROM posts WHERE id IN (?) AND brand_id=?", (brand_id(),))}
+    handed = {r["post_id"] for r in _in_chunks(list(posts), "SELECT DISTINCT post_id FROM targets WHERE post_id IN (?) AND status='handed'")}
+    done, skipped = 0, 0
+    shift = int(b.get("minutes") or 0) * 60
+    now = store.now()
+    with store.transaction() as c:
+        for pid, p in posts.items():
+            if action == "delete":
+                c.execute("DELETE FROM targets WHERE post_id=?", (pid,))
+                c.execute("DELETE FROM posts WHERE id=?", (pid,))
+            elif pid in handed or (action in ("unschedule", "now", "shift") and p["status"] not in ("scheduled", "draft")):
+                skipped += 1
+                continue
+            elif action == "unschedule":
+                if p["status"] != "scheduled":
+                    skipped += 1
+                    continue
+                c.execute("UPDATE posts SET status='draft', scheduled_at=NULL WHERE id=?", (pid,))
+            elif action == "retry":
+                if p["status"] not in ("failed", "partial"):
+                    skipped += 1
+                    continue
+                c.execute("UPDATE targets SET status='pending', attempts=0, next_try_at=NULL, error='' WHERE post_id=? AND status='failed'", (pid,))
+                c.execute("UPDATE posts SET status='scheduled', scheduled_at=? WHERE id=?", (now, pid))
+            elif action == "now":
+                c.execute("UPDATE posts SET status='scheduled', scheduled_at=? WHERE id=?", (now, pid))
+            elif action == "shift":
+                if not p["scheduled_at"] or p["scheduled_at"] + shift < now + 60:
+                    skipped += 1
+                    continue
+                c.execute("UPDATE posts SET scheduled_at=? WHERE id=?", (p["scheduled_at"] + shift, pid))
+            done += 1
+    if handed and action == "delete":
+        store.log("posts", "Some deleted posts were already uploaded to the network's scheduler — delete them there too (e.g. YouTube Studio).", "warn")
+    if action in ("retry", "now"):
+        threading.Thread(target=eng.dispatch, daemon=True).start()
+    return ok(done=done, skipped=skipped + len(set(ids) - set(posts)))
 
 
 def _block_if_handed(pid: int) -> None:
@@ -722,7 +1021,7 @@ def reminders():
     rows = store.rows("SELECT t.id FROM targets t JOIN posts p ON p.id=t.post_id WHERE p.brand_id=? AND t.status='reminder' ORDER BY t.published_at",
                       (brand_id(),))
     out = []
-    for r in rows:
+    for r in rows[:200]:
         t = store.one("SELECT t.*, a.name account_name, a.extra FROM targets t LEFT JOIN accounts a ON a.id=t.account_id WHERE t.id=?", (r["id"],))
         p = store.one("SELECT * FROM posts WHERE id=?", (t["post_id"],))
         po = post_out(p)
@@ -735,7 +1034,7 @@ def reminders():
 @app.get("/api/queue/next")
 def queue_next():
     ids = [int(x) for x in (request.args.get("accounts") or "").split(",") if x.strip().isdigit()]
-    return jsonify(ts=engine_mod.next_free_slot(ids))
+    return jsonify(ts=engine_mod.next_free_slot(ids, brand_id=brand_id()))
 
 
 @app.get("/api/best-times")
@@ -903,7 +1202,7 @@ def import_csv():
                 errors.append(f"Row {i}: date “{row['date']}” not understood (use YYYY-MM-DD HH:MM).")
                 continue
         if when is None or when < store.now():
-            when = engine_mod.next_free_slot(ids)
+            when = engine_mod.next_free_slot(ids, brand_id=brand_id())
         pid = store.execute("INSERT INTO posts(brand_id,status,text,media,link,scheduled_at,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
                             (brand_id(), "scheduled", body_text, json.dumps(media_ids), row.get("link", ""), when, "csv", store.now(), store.now()))
         store.executemany("INSERT INTO targets(post_id,account_id) VALUES(?,?)", [(pid, a) for a in ids])
@@ -1166,12 +1465,13 @@ def logins():
 @app.get("/api/limits")
 def limits_get():
     nets = {}
+    bid = brand_id()
     for c in connectors.ORDER:
-        nets[c.key] = [{"limit": n, "window": w, "label": lbl} for n, w, lbl in limits.rules(c.key)]
+        nets[c.key] = [{"limit": n, "window": w, "label": lbl} for n, w, lbl in limits.rules(c.key, bid)]
     accs = [{"id": a["id"], "name": a["name"], "network": a["network"], "usage": limits.usage(a),
              "waiting": store.scalar("SELECT COUNT(*) FROM targets WHERE account_id=? AND status='pending' AND limit_note<>''", (a["id"],), 0)}
             for a in store.rows("SELECT * FROM accounts WHERE brand_id=?", (brand_id(),))]
-    return jsonify(networks=nets, accounts=accs, x_plan=store.get("x_plan"), overrides=store.jd(store.get("limits")),
+    return jsonify(networks=nets, accounts=accs, x_plan=store.bget(bid, "x_plan"), overrides=store.jd(store.get("limits")),
                    defaults={k: [{"limit": n, "window": w} for n, w, _ in v] for k, v in limits.DEFAULTS.items()})
 
 
@@ -1179,7 +1479,7 @@ def limits_get():
 def limits_save():
     b = body()
     if b.get("x_plan") in limits.X_PLANS:
-        store.set("x_plan", b["x_plan"])
+        store.bset(brand_id(), "x_plan", b["x_plan"])
     if "overrides" in b:
         clean = {}
         for net_key, rows in (b.get("overrides") or {}).items():
@@ -1198,13 +1498,15 @@ def limits_save():
 
 
 # ------------------------------------------------------------------ settings
-SETTINGS_PUBLIC = ["theme", "ai_provider", "ollama_model", "media_host", "public_base", "utm_source", "utm_medium", "utm_campaign", "retry_max", "notify",
-                   "health_hour", "inbox_every_min", "x_plan", "native_schedule"]
+SETTINGS_PUBLIC = ["theme", "ai_provider", "ollama_model", "media_host", "public_base", "retry_max", "notify",
+                   "health_hour", "inbox_every_min", "parallel", "video_parallel"]
 
 
 @app.get("/api/settings")
 def settings_get():
     s = {k: store.get(k) for k in SETTINGS_PUBLIC}
+    bid = brand_id()
+    s.update({k: store.bget(bid, k) for k in ("utm_source", "utm_medium", "utm_campaign", "x_plan", "native_schedule")})
     s.update(anthropic_key_set=bool(store.get_secret("anthropic_key")), ai_active=ai.provider(), ollama=ai.ollama_ok(),
              data_dir=app_paths.data_dir(), version=APP_VERSION, default_slots=store.jl(store.get("default_slots")),
              tunnel=tunnel.status(), redirect=redirect_uri())
@@ -1236,8 +1538,16 @@ def settings_save():
         elif k == "inbox_every_min":
             store.set(k, max(3, min(240, int(v))))
         elif k == "native_schedule":
-            store.set(k, 1 if v else 0)
-        elif k in ("theme", "ollama_model", "utm_source", "utm_medium", "utm_campaign", "notify"):
+            store.bset(brand_id(), k, 1 if v else 0)
+        elif k in ("utm_source", "utm_medium", "utm_campaign"):
+            store.bset(brand_id(), k, (v or "").strip())
+        elif k == "x_plan" and v in limits.X_PLANS:
+            store.bset(brand_id(), k, v)
+        elif k == "parallel":
+            store.set(k, max(1, min(12, int(v))))
+        elif k == "video_parallel":
+            store.set(k, max(1, min(6, int(v))))
+        elif k in ("theme", "ollama_model", "notify"):
             store.set(k, v)
     return ok()
 

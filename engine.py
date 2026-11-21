@@ -84,7 +84,8 @@ def build(post: dict, target: dict, account: dict) -> dict:
     opts = store.jd(target["options"])
     link = (post.get("link") or "").strip()
     if link and post.get("utm"):
-        link = add_utm(link, account["network"], store.get("utm_source"), store.get("utm_medium"), store.get("utm_campaign"))
+        bid = post.get("brand_id")
+        link = add_utm(link, account["network"], store.bget(bid, "utm_source"), store.bget(bid, "utm_medium"), store.bget(bid, "utm_campaign"))
     text_no_link = text
     if link and link not in text:
         text = f"{text}\n\n{link}".strip()
@@ -127,36 +128,62 @@ def validate_post(post: dict, targets: list[dict]) -> dict:
 
 
 # ------------------------------------------------------------------ queue (time slots)
-def slots_of(account: dict | None) -> list[dict]:
+def slots_of(account: dict | None, brand_id: int | None = None) -> list[dict]:
     s = store.jl(account.get("slots")) if account and account.get("slots") else None
-    return s or store.jl(store.get("default_slots"))
+    if s:
+        return s
+    bid = store.brand_of_account(account) if account else (brand_id or store.get("brand_id"))
+    return store.jl(store.bget(bid, "default_slots"))
 
 
-def next_free_slot(account_ids: list[int], after: float | None = None, exclude_post: int | None = None) -> int:
-    after = after or time.time()
-    accounts = [store.one("SELECT * FROM accounts WHERE id=?", (i,)) for i in account_ids] or [None]
+def _slot_inputs(account_ids: list[int], after: float, exclude_post: int | None, brand_id: int | None):
+    accounts = [a for a in (store.one("SELECT * FROM accounts WHERE id=?", (i,)) for i in account_ids) if a] or [None]
     slots = []
     for a in accounts:
-        slots += slots_of(a)
+        slots += slots_of(a, brand_id)
     if not slots:
         slots = [{"days": "0123456", "time": "10:00"}]
     q = ("SELECT DISTINCT p.scheduled_at FROM posts p JOIN targets t ON t.post_id=p.id WHERE p.status='scheduled' AND p.scheduled_at>=?"
          + (f" AND t.account_id IN ({','.join('?' * len(account_ids))})" if account_ids else "") + (" AND p.id<>?" if exclude_post else ""))
     args = [int(after) - 3600] + list(account_ids) + ([exclude_post] if exclude_post else [])
-    taken = [r["scheduled_at"] for r in store.rows(q, args)]
+    return slots, sorted(r["scheduled_at"] for r in store.rows(q, args))
+
+
+def free_slots(account_ids: list[int], count: int, after: float | None = None, exclude_post: int | None = None,
+               brand_id: int | None = None, per_day: int = 0) -> list[int]:
+    """The next `count` free queue slots for these accounts (one query, so hundreds of posts are planned at once).
+    per_day > 0 = never more than that many of these new posts on one day."""
+    import bisect
+    after = after or time.time()
+    slots, taken = _slot_inputs(account_ids, after, exclude_post, brand_id)
     start = datetime.fromtimestamp(after).replace(second=0, microsecond=0)
-    for d in range(0, 90):
+    out: list[int] = []
+    for d in range(0, 3650):
+        if len(out) >= count:
+            break
         day = (start + timedelta(days=d)).date()
         times = sorted({s["time"] for s in slots if str(day.weekday()) in (s.get("days") or "0123456")})
+        used_today = 0
         for t in times:
+            if len(out) >= count or (per_day and used_today >= per_day):
+                break
             hh, mm = (int(x) for x in t.split(":"))
             ts = int(datetime(day.year, day.month, day.day, hh, mm).timestamp())
             if ts <= after + 60:
                 continue
-            if any(abs(ts - x) < 600 for x in taken):
+            i = bisect.bisect_left(taken, ts - 599)
+            if i < len(taken) and taken[i] < ts + 600:
                 continue
-            return ts
-    return int(after + 3600)
+            out.append(ts)
+            bisect.insort(taken, ts)
+            used_today += 1
+    while len(out) < count:                       # no slots at all: one per hour after the last
+        out.append((out[-1] if out else int(after)) + 3600)
+    return out
+
+
+def next_free_slot(account_ids: list[int], after: float | None = None, exclude_post: int | None = None, brand_id: int | None = None) -> int:
+    return free_slots(account_ids, 1, after, exclude_post, brand_id)[0]
 
 
 BEST_DEFAULT = {  # research-based starting points (local time), refined with your own stats
@@ -188,8 +215,12 @@ def best_times(networks: list[str]) -> list[dict]:
 # ------------------------------------------------------------------ the engine
 class Engine:
     def __init__(self):
-        self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="publish")
+        self.workers = max(1, min(12, store.get("parallel") or 4))
+        self.pool = ThreadPoolExecutor(max_workers=12, thread_name_prefix="publish")   # real limit = self.workers (setting)
+        self.video_gate = threading.BoundedSemaphore(12)
+        self.videos_now = 0
         self.busy_accounts: set[int] = set()
+        self.jobs_busy: set[str] = set()
         self.lock = threading.Lock()
         self._stop = threading.Event()
         self.next_feeds = self.next_metrics = self.next_tokens = 0.0
@@ -212,21 +243,24 @@ class Engine:
             self._stop.wait(2)
 
     def tick(self):
+        self.workers = max(1, min(12, store.get("parallel") or 4))
         self.dispatch()
         self.go_live()
         now = time.time()
         if now >= self.next_handoff:
             self.next_handoff = now + 60
             self.handoff()
+        # slow network work never runs inside the publishing loop: each job in its own thread, one at a time
         if now >= self.next_feeds:
             self.next_feeds = now + 60
-            self.check_feeds()
+            self._job("feeds", self.check_feeds)
         if now >= self.next_metrics:
             self.next_metrics = now + 600
-            self.refresh_metrics()
+            self._job("metrics", self.refresh_metrics)
         if now >= self.next_tokens:
             self.next_tokens = now + 3600
-            self.refresh_tokens()
+            self._job("tokens", self.refresh_tokens)
+            self._job("tidy", self.tidy)
         if now >= self.next_inbox and not self.inbox_busy:
             self.next_inbox = now + 45
             threading.Thread(target=self._bg, args=(self.sync_inbox,), daemon=True, name="inbox").start()
@@ -236,6 +270,33 @@ class Engine:
                 threading.Thread(target=self._bg, args=(self.check_health,), daemon=True, name="health").start()
         if _tunnel_last_use and now - _tunnel_last_use > 900:
             self._stop_tunnel()
+
+    def _job(self, name: str, fn) -> None:
+        if name in self.jobs_busy:
+            return
+        self.jobs_busy.add(name)
+
+        def run():
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+            finally:
+                self.jobs_busy.discard(name)
+        threading.Thread(target=run, daemon=True, name=name).start()
+
+    def tidy(self) -> None:
+        """Keep the database small and fast: old activity lines go (60 days / last 20,000 kept)."""
+        store.execute("DELETE FROM activity WHERE ts < ?", (store.now() - 60 * 86400,))
+        top = store.scalar("SELECT id FROM activity ORDER BY id DESC LIMIT 1 OFFSET 20000", (), 0)
+        if top:
+            store.execute("DELETE FROM activity WHERE id <= ?", (top,))
+        # a target left in "publishing" without a worker (should never happen) goes back to the queue after 3 h
+        with self.lock:
+            busy = set(self.busy_accounts)
+        for t in store.rows("SELECT id, account_id FROM targets WHERE status='publishing'"):
+            if t["account_id"] not in busy:
+                store.execute("UPDATE targets SET status='pending' WHERE id=? AND status='publishing'", (t["id"],))
 
     def _bg(self, fn, *a):
         try:
@@ -253,42 +314,60 @@ class Engine:
             _tunnel_last_use = 0.0
 
     # --- publishing
-    def due_targets(self, limit=20) -> list[dict]:
+    def due_targets(self, limit=200, exclude: set | None = None) -> list[dict]:
+        """The oldest due target of every account (fair: 300 videos for one channel never hold up the other brands)."""
         now = store.now()
-        return store.rows("SELECT t.* FROM targets t JOIN posts p ON p.id=t.post_id WHERE p.status='scheduled' AND p.scheduled_at<=?"
-                          " AND t.status='pending' AND COALESCE(t.next_try_at,0)<=? ORDER BY p.scheduled_at, t.id LIMIT ?", (now, now, limit))
+        ex = sorted(exclude or ())
+        rows = store.rows("SELECT * FROM (SELECT t.*, p.scheduled_at sched, ROW_NUMBER() OVER (PARTITION BY t.account_id ORDER BY p.scheduled_at, t.id) rn"
+                          " FROM targets t JOIN posts p ON p.id=t.post_id WHERE p.status='scheduled' AND p.scheduled_at<=? AND t.status='pending'"
+                          " AND COALESCE(t.next_try_at,0)<=?" + (f" AND t.account_id NOT IN ({','.join('?' * len(ex))})" if ex else "")
+                          + ") WHERE rn=1 ORDER BY sched, id LIMIT ?", (now, now, *ex, limit))
+        return rows
 
     def dispatch(self, wait: bool = False):
         futures = []
-        for t in self.due_targets():
-            with self.lock:
-                if t["account_id"] in self.busy_accounts:
-                    continue
-                # claim atomically: if another thread already took this target, skip it
-                if not store.update("UPDATE targets SET status='publishing' WHERE id=? AND status='pending'", (t["id"],)):
-                    continue
-                self.busy_accounts.add(t["account_id"])
-            futures.append(self.pool.submit(self._publish_safe, t["id"]))
+        with self.lock:
+            busy = set(self.busy_accounts)
+        free = self.workers - len(busy)
+        if free > 0 or wait:
+            for t in self.due_targets(exclude=busy):
+                with self.lock:
+                    if len(self.busy_accounts) >= self.workers and not wait:
+                        break
+                    if t["account_id"] in self.busy_accounts:
+                        continue
+                    # claim atomically: if another thread already took this target, skip it
+                    if not store.update("UPDATE targets SET status='publishing' WHERE id=? AND status='pending'", (t["id"],)):
+                        continue
+                    self.busy_accounts.add(t["account_id"])
+                futures.append(self.pool.submit(self._publish_safe, t["id"]))
         if wait:
             for f in futures:
                 f.result()
             self.wait_idle()
 
     # --- network-side scheduling (YouTube publishAt, Facebook scheduled_publish_time)
-    def handoff_candidates(self, limit: int = 40) -> list[dict]:
-        """Scheduled targets that their network can publish by itself, in its accepted window, not tried natively yet."""
-        if not store.get("native_schedule"):
-            return []
+    def handoff_candidates(self, limit: int = 200) -> list[dict]:
+        """Scheduled targets that their network can publish by itself, in its accepted window, not tried natively yet
+        (the earliest one per account; only brands that have the option on)."""
         now = store.now()
-        rows = store.rows("SELECT t.*, p.scheduled_at sched, a.network, a.status acc_status FROM targets t JOIN posts p ON p.id=t.post_id"
-                          " JOIN accounts a ON a.id=t.account_id WHERE p.status='scheduled' AND t.status='pending' AND p.scheduled_at>?"
-                          " AND COALESCE(t.next_try_at,0)<=? AND COALESCE(t.native_skip,0)=0 ORDER BY p.scheduled_at, t.id LIMIT ?",
-                          (now, now, limit))
-        out = []
+        nets = [k for k, c in connectors.REGISTRY.items() if getattr(c, "native_schedule", None)]
+        if not nets:
+            return []
+        rows = store.rows("SELECT * FROM (SELECT t.*, p.scheduled_at sched, a.network, a.status acc_status, a.brand_id,"
+                          " ROW_NUMBER() OVER (PARTITION BY t.account_id ORDER BY p.scheduled_at, t.id) rn"
+                          " FROM targets t JOIN posts p ON p.id=t.post_id JOIN accounts a ON a.id=t.account_id"
+                          " WHERE p.status='scheduled' AND t.status='pending' AND p.scheduled_at>? AND COALESCE(t.next_try_at,0)<=?"
+                          f" AND COALESCE(t.native_skip,0)=0 AND a.network IN ({','.join('?' * len(nets))})) WHERE rn=1 ORDER BY sched, id LIMIT ?",
+                          (now, now, *nets, limit))
+        out, on = [], {}
         for t in rows:
-            c = connectors.REGISTRY.get(t["network"])
-            win = getattr(c, "native_schedule", None) if c else None
-            if win and t["acc_status"] == "ok" and win[0] <= t["sched"] - now <= win[1]:
+            if t["brand_id"] not in on:
+                on[t["brand_id"]] = bool(store.bget(t["brand_id"], "native_schedule"))
+            if not on[t["brand_id"]]:
+                continue
+            win = connectors.REGISTRY[t["network"]].native_schedule
+            if t["acc_status"] == "ok" and win[0] <= t["sched"] - now <= win[1]:
                 out.append(t)
         return out
 
@@ -296,7 +375,7 @@ class Engine:
         futures = []
         for t in self.handoff_candidates():
             with self.lock:
-                if t["account_id"] in self.busy_accounts:
+                if t["account_id"] in self.busy_accounts or (len(self.busy_accounts) >= self.workers and not wait):
                     continue
                 if not store.update("UPDATE targets SET status='publishing' WHERE id=? AND status='pending'", (t["id"],)):
                     continue
@@ -350,6 +429,12 @@ class Engine:
         conn = connectors.get(a["network"])
         label = f"{conn.name} · {a['name']}"
         sched = int(post["scheduled_at"] or 0)
+        if a["status"] == "paused":
+            if native:
+                return self._native_back(t, retry_at=min(store.now() + 1800, sched))
+            store.execute("UPDATE targets SET status='pending', next_try_at=?, limit_note='paused', error=? WHERE id=?",
+                          (store.now() + 300, "Waiting — this account is paused. Resume it in Accounts and it goes out.", target_id))
+            return None
         try:
             if a["status"] == "expired":
                 raise PublishError("This account's login expired — reconnect it in Accounts.", "auth")
@@ -376,7 +461,18 @@ class Engine:
                 if e.kind == "rate":
                     return self._defer(t, a, label, store.now() + int(e.retry_after or 3600), str(e))
                 raise
-            res = conn.publish(account_out(a), creds, payload)
+            has_video = any(m["kind"] == "video" for m in payload["media"])
+            if has_video and not self._video_lane():
+                # all video lanes busy: try again in a moment (doesn't count as a failure)
+                if native:
+                    return self._native_back(t, retry_at=store.now() + 30)
+                store.execute("UPDATE targets SET status='pending', next_try_at=? WHERE id=?", (store.now() + 20, target_id))
+                return None
+            try:
+                res = conn.publish(account_out(a), creds, payload)
+            finally:
+                if has_video:
+                    self._video_done()
         except PublishError as e:
             if native and e.kind not in ("auth", "transient", "rate"):
                 # the network refused its own scheduling for this post: publish it the normal way at its time
@@ -405,6 +501,17 @@ class Engine:
         else:
             store.log("publish", f"Published on {label}", "good")
         self.finalize(post["id"])
+
+    def _video_lane(self) -> bool:
+        with self.lock:
+            if self.videos_now >= max(1, min(self.workers, store.get("video_parallel") or 2)):
+                return False
+            self.videos_now += 1
+            return True
+
+    def _video_done(self) -> None:
+        with self.lock:
+            self.videos_now = max(0, self.videos_now - 1)
 
     def _defer(self, t, a, label, when: int, why: str) -> None:
         """Rate-limit guard: keep the post queued until the network allows it (does not count as a failed attempt)."""
@@ -488,13 +595,17 @@ class Engine:
             time.sleep(0.3)
         return n
 
+    def queue_stats(self) -> dict:
+        with self.lock:
+            return {"workers": self.workers, "busy": len(self.busy_accounts), "videos": self.videos_now}
+
     # --- tokens
     def refresh_tokens(self) -> None:
         now = store.now()
         for a in store.rows("SELECT * FROM accounts WHERE expires_at IS NOT NULL AND expires_at < ?", (now + 7 * 86400,)):
             conn = connectors.get(a["network"])
             try:
-                new = conn.refresh(account_out(a), store.creds_of(a), store.app_creds(connectors.app_key(a["network"])))
+                new = conn.refresh(account_out(a), store.creds_of(a), store.account_app(a, connectors.app_key(a["network"])))
             except PublishError:
                 new = None
             if new:
@@ -670,7 +781,7 @@ class Engine:
         elif f["mode"] == "now":
             status, when = "scheduled", store.now()
         else:
-            status, when = "scheduled", next_free_slot(accounts)
+            status, when = "scheduled", next_free_slot(accounts, brand_id=f["brand_id"])
         pid = store.execute("INSERT INTO posts(brand_id,status,text,media,scheduled_at,source,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                             (f["brand_id"], status, text, json.dumps(media_ids), when, "rss", store.now(), store.now()))
         store.executemany("INSERT INTO targets(post_id,account_id) VALUES(?,?)", [(pid, a) for a in accounts])

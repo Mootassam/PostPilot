@@ -5,7 +5,7 @@
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
-const S = {status: null, nets: {}, netList: [], accounts: [], page: '', live: null, lastNote: 0, notifyAsked: false};
+const S = {status: null, nets: {}, netList: [], accounts: [], page: '', live: null, lastNote: 0, notifyAsked: false, rev: -1, liveAt: 0};
 const nf = n => n == null ? '—' : n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K' : Number(n).toLocaleString();
 const now = () => Date.now() / 1000;
 // thumbnail for any media item: image/GIF/video poster as <img>, or a frame of the video itself when it has no poster yet
@@ -207,7 +207,10 @@ function renderNav() {
     const aiTxt = {anthropic: 'Claude AI ready', ollama: 'Local AI (Ollama) ready', basic: 'AI: basic helpers', off: 'AI off'}[S.status.ai];
     $('#sideFoot').innerHTML = `<div class="row">${icInline('spark')} ${aiTxt}</div><div class="row">${icInline('globe')} 100% local · data stays on this PC</div>${S.status.fake ? '<div class="pill a">Demo mode</div>' : ''}`;
     $('#bellBtn').innerHTML = ic('bell') + (c.reminders ? `<span class="dotn">${c.reminders}</span>` : '');
-    $('#topStatus').innerHTML = c.publishing ? `<span class="pill s"><span class="spin" style="width:10px;height:10px"></span> Publishing ${c.publishing}…</span>` : '';
+    const q = S.status.queue || {};
+    const br = S.status.brands.find(b => b.id === S.status.brand_id) || {};
+    $('#topStatus').innerHTML = `<span class="pill brandpill" title="Current brand — everything you see belongs to it" onclick="go('settings')"><i style="background:${esc(br.color || '#6d5dfc')}"></i>${esc(br.name || '')}</span>`
+      + (c.publishing ? ` <span class="pill s" title="${q.videos ? q.videos + ' video upload(s) running · ' : ''}${q.workers || 4} at the same time max"><span class="spin" style="width:10px;height:10px"></span> Publishing ${c.publishing}${S.status.due > c.publishing ? ` · ${S.status.due - c.publishing} waiting` : ''}…</span>` : '');
   }
 }
 async function switchBrand(v) {
@@ -247,7 +250,9 @@ async function pollStatus() {
   }
   S.lastNote = st.last_activity || 0;
   renderNav();
-  if (S.live && !modalOpen() && !document.hidden) S.live();
+  const changed = st.rev !== S.rev;
+  S.rev = st.rev;
+  if (S.live && !modalOpen() && !document.hidden && !S.selecting && (changed || Date.now() - S.liveAt > 60000)) { S.liveAt = Date.now(); S.live(); }
 }
 
 // ------------------------------------------------------------------ router
@@ -413,25 +418,65 @@ function calNav(n) { const a = CAL.anchor; CAL.anchor = CAL.view === 'month' ? n
 function calCreate(iso) { const d = new Date(iso); d.setHours(10, 0, 0, 0); if (d < new Date()) d.setTime(Date.now() + 3600000); openComposer({when: Math.floor(d / 1000)}); }
 
 // ================================================================== POSTS
-const PL = {tab: 'scheduled', q: ''};
+const PL = {tab: 'scheduled', q: '', shown: 100, sel: new Set()};
 PAGES.posts = {title: 'Posts', sub: 'Your queue, drafts and history', render: async (el, arg) => {
-  if (arg && ['scheduled', 'draft', 'published', 'failed'].includes(arg)) PL.tab = arg;
-  const d = await api(`/api/posts?status=${PL.tab}&q=${encodeURIComponent(PL.q)}`);
+  if (arg && ['scheduled', 'draft', 'published', 'failed'].includes(arg) && arg !== PL.tab) { PL.tab = arg; PL.shown = 100; PL.sel.clear(); }
+  const d = await api(`/api/posts?status=${PL.tab}&q=${encodeURIComponent(PL.q)}&limit=${PL.shown}`);
+  PL.posts = d.posts;
+  PL.sel = new Set([...PL.sel].filter(id => d.posts.some(p => p.id === id)));
   const c = S.status.counts;
   let lastDay = '';
   el.innerHTML = `<div class="card"><div class="card-h"><div class="chips">${[['scheduled', 'Scheduled', c.scheduled], ['draft', 'Drafts', c.drafts], ['published', 'Published'], ['failed', 'Failed', c.failed]]
-      .map(([k, l, n]) => `<button class="chip ${PL.tab === k ? 'on' : ''}" onclick="PL.tab='${k}';route()">${l}${n ? ` <span class="n">${n}</span>` : ''}</button>`).join('')}</div>
-      <div class="act"><div class="search">${ic('search', 15)}<input class="in sm" placeholder="Search posts" value="${esc(PL.q)}" oninput="PL.q=this.value;debouncedPosts()"></div><button class="btn pri sm" onclick="openComposer()">${ic('plus', 14)}Create post</button></div></div>
-    <div>${d.posts.length ? d.posts.map(p => {
+      .map(([k, l, n]) => `<button class="chip ${PL.tab === k ? 'on' : ''}" onclick="PL.tab='${k}';PL.shown=100;PL.sel.clear();route()">${l}${n ? ` <span class="n">${n}</span>` : ''}</button>`).join('')}</div>
+      <div class="act"><div class="search">${ic('search', 15)}<input class="in sm" placeholder="Search posts" value="${esc(PL.q)}" oninput="PL.q=this.value;debouncedPosts()"></div>
+      ${d.posts.length ? `<button class="btn sm" onclick="plSelectAll()">${PL.sel.size && PL.sel.size === d.posts.length ? 'Unselect all' : 'Select all'}</button>` : ''}
+      <button class="btn soft sm" onclick="bulkDialog()">${ic('upload', 14)}Bulk schedule</button><button class="btn pri sm" onclick="openComposer()">${ic('plus', 14)}Create post</button></div></div>
+    <div id="plBar"></div>
+    <div id="plList">${d.posts.length ? d.posts.map(p => {
       const ts = PL.tab === 'scheduled' ? p.scheduled_at : (p.published_at || p.updated_at);
       const day = ts ? new Date(ts * 1000).toLocaleDateString(undefined, {weekday: 'long', day: 'numeric', month: 'long'}) : '';
       const head = PL.tab === 'scheduled' && day !== lastDay ? `<div class="daygroup">${day}</div>` : '';
       lastDay = day;
-      return head + postRow(p);
+      return head + `<div class="selrow ${PL.sel.has(p.id) ? 'on' : ''}"><label class="selbox" title="Select"><input type="checkbox" ${PL.sel.has(p.id) ? 'checked' : ''} onchange="plToggle(${p.id},this.checked)"></label>${postRow(p)}</div>`;
     }).join('') : emptyState('list', {scheduled: 'Nothing scheduled', draft: 'No drafts', published: 'Nothing published yet', failed: 'No failed posts 🎉'}[PL.tab],
-      PL.tab === 'failed' ? 'Everything went out fine.' : 'Create a post to get started.', PL.tab !== 'failed' ? `<button class="btn pri" onclick="openComposer()">${ic('plus')}Create post</button>` : '')}</div></div>`;
-  S.live = debounce(() => { if (S.page === 'posts' && !document.activeElement.matches('input')) PAGES.posts.render(el); }, 100);
+      PL.tab === 'failed' ? 'Everything went out fine.' : 'Create a post — or bulk schedule many videos at once.', PL.tab !== 'failed' ? `<button class="btn pri" onclick="openComposer()">${ic('plus')}Create post</button> <button class="btn" onclick="bulkDialog()">${ic('upload')}Bulk schedule</button>` : '')}</div>
+    ${d.has_more ? `<div class="card-b" style="text-align:center"><button class="btn" onclick="PL.shown+=100;PAGES.posts.render($('#content'))">Show more (${d.total - d.posts.length} more)</button></div>` : d.total > 100 ? `<div class="card-b tiny muted" style="text-align:center">All ${d.total} shown</div>` : ''}</div>`;
+  plBar();
+  S.live = debounce(() => { if (S.page === 'posts' && !document.activeElement.matches('input') && !PL.sel.size) PAGES.posts.render(el); }, 100);
 }};
+function plToggle(id, on) { on ? PL.sel.add(id) : PL.sel.delete(id); const row = $(`#plList input[onchange="plToggle(${id},this.checked)"]`); if (row) row.closest('.selrow').classList.toggle('on', on); plBar(); }
+function plSelectAll() { const all = PL.posts.length && PL.sel.size === PL.posts.length; PL.sel = new Set(all ? [] : PL.posts.map(p => p.id)); PAGES.posts.render($('#content')); }
+function plBar() {
+  const n = PL.sel.size, el = $('#plBar');
+  if (!el) return;
+  S.selecting = n > 0;
+  el.innerHTML = n ? `<div class="bulkbar"><b>${n} selected</b><span class="sp"></span>
+    ${PL.tab === 'failed' ? `<button class="btn sm" onclick="plAct('retry')">${ic('refresh', 14)}Retry</button>` : ''}
+    ${['scheduled', 'draft'].includes(PL.tab) ? `<button class="btn sm" onclick="plShift()">${ic('clock', 14)}Move times…</button><button class="btn sm" onclick="plAct('now')">${ic('send', 14)}Publish now</button>` : ''}
+    ${PL.tab === 'scheduled' ? `<button class="btn sm" onclick="plAct('unschedule')">${ic('file', 14)}Move to drafts</button>` : ''}
+    <button class="btn sm danger" onclick="plAct('delete')">${ic('trash', 14)}Delete</button><button class="btn sm ghost" onclick="PL.sel.clear();PAGES.posts.render($('#content'))">Cancel</button></div>` : '';
+}
+async function plAct(action, extra = {}) {
+  const n = PL.sel.size;
+  const words = {delete: ['Delete', `Delete ${n} post(s)?`, 'They are removed from PostPilot. Posts already on the networks stay there.'],
+    now: ['Publish now', `Publish ${n} post(s) now?`, 'They go out right away, one at a time per account (network limits are respected).'],
+    unschedule: ['Move', `Move ${n} post(s) to drafts?`, 'They will not be published until you schedule them again.'],
+    retry: ['Retry', `Retry ${n} failed post(s)?`, 'Failed accounts are tried again now.']}[action];
+  if (words && !await confirmBox(words[1], words[2], words[0], action === 'delete')) return;
+  await run(null, async () => {
+    const r = await post('/api/posts/bulk-action', {ids: [...PL.sel], action, ...extra});
+    toast(`${r.done} post(s) updated${r.skipped ? ` · ${r.skipped} skipped (already uploaded to the network or not possible)` : ''}`, r.skipped ? 'warn' : 'ok');
+    PL.sel.clear(); PAGES.posts.render($('#content')); pollStatus();
+  });
+}
+function plShift() {
+  const m = modal({title: `Move ${PL.sel.size} post(s)`, body: `<p class="small muted" style="margin-top:0">Every selected post moves by the same amount. Posts already uploaded to YouTube/Facebook's own scheduler stay as they are.</p>
+    <div class="row"><select class="in" id="shD" style="width:auto"><option value="1">Later</option><option value="-1">Earlier</option></select>
+    <input class="in" type="number" id="shN" value="1" min="1" style="width:90px"><select class="in" id="shU" style="width:auto"><option value="60">hour(s)</option><option value="1440">day(s)</option><option value="1">minute(s)</option></select></div>`,
+    foot: `<button class="btn" data-c>Cancel</button><button class="btn pri" id="shGo">Move</button>`});
+  m.el.querySelector('[data-c]').onclick = m.close;
+  $('#shGo').onclick = () => { const mins = +$('#shD').value * Math.max(1, +$('#shN').value) * +$('#shU').value; m.close(); plAct('shift', {minutes: mins}); };
+}
 const debouncedPosts = debounce(() => PAGES.posts.render($('#content')), 300);
 
 // ================================================================== IDEAS
@@ -478,14 +523,22 @@ async function brainstorm(btn) {
 }
 
 // ================================================================== MEDIA
-const MD = {q: ''};
+const MD = {q: '', kind: '', shown: 200, sel: new Set(), unused: false};
 PAGES.media = {title: 'Media library', sub: 'Every image and video, reusable in any post', render: async el => {
-  const d = await api('/api/media?q=' + encodeURIComponent(MD.q));
-  el.innerHTML = `<label class="dropzone" id="dz">${ic('upload', 26).replace('class="i"', 'class="i" style="margin:0 auto 6px"')}<b>Drop images or videos here</b> or click to upload<div class="tiny">JPG, PNG, GIF, WEBP, MP4, MOV… — PostPilot resizes automatically for each network</div><input type="file" multiple hidden id="mdFile" accept="image/*,video/*"></label>
-    <div class="row mb"><div class="search" style="flex:1;max-width:340px">${ic('search', 15)}<input class="in sm" placeholder="Search by name or alt text" value="${esc(MD.q)}" oninput="MD.q=this.value;debouncedMedia()"></div><span class="muted small">${d.media.length} file(s)</span></div>
-    ${d.media.length ? `<div class="mgrid">${d.media.map(m => `<div class="mcard" onclick="mediaDetail(${m.id})"><div class="img">${mthumb(m)}</div>
-      <div class="cap"><div class="ell b">${esc(m.name)}</div><div class="tiny muted">${m.kind}${m.width ? ` · ${m.width}×${m.height}` : ''} · ${(m.size / 1048576).toFixed(1)} MB${m.used ? ` · used ${m.used}×` : ''}</div></div></div>`).join('')}</div>` : emptyState('image', 'No media yet', 'Upload your photos and videos once — reuse them in any post.')}`;
+  const d = await api(`/api/media?q=${encodeURIComponent(MD.q)}&kind=${MD.kind}&limit=${MD.shown}`);
+  const list = MD.unused ? d.media.filter(m => !m.used) : d.media;
+  el.innerHTML = `<label class="dropzone" id="dz">${ic('upload', 26).replace('class="i"', 'class="i" style="margin:0 auto 6px"')}<b>Drop images or videos here</b> or click to upload — as many as you like<div class="tiny">JPG, PNG, GIF, WEBP, MP4, MOV… — uploaded one by one with progress · resized automatically for each network</div><input type="file" multiple hidden id="mdFile" accept="image/*,video/*"></label>
+    <div class="row mb"><div class="search" style="flex:1;max-width:300px">${ic('search', 15)}<input class="in sm" placeholder="Search by name or alt text" value="${esc(MD.q)}" oninput="MD.q=this.value;debouncedMedia()"></div>
+      <div class="chips">${[['', 'All'], ['video', 'Videos'], ['image', 'Photos']].map(([k, l]) => `<button class="chip ${MD.kind === k ? 'on' : ''}" onclick="MD.kind='${k}';MD.shown=200;route()">${l}</button>`).join('')}
+      <button class="chip ${MD.unused ? 'on' : ''}" onclick="MD.unused=!MD.unused;route()" title="Files no post uses yet">Not used yet</button></div>
+      <span class="muted small">${d.total} file(s)</span><span class="sp"></span>
+      ${list.length ? `<button class="btn sm" onclick="mdSelectAll()">${MD.sel.size && list.every(m => MD.sel.has(m.id)) ? 'Unselect all' : 'Select all shown'}</button>` : ''}
+      <button class="btn pri sm" ${MD.sel.size ? '' : 'disabled'} onclick="bulkDialog([...MD.sel])">${ic('cal', 14)}Schedule ${MD.sel.size || ''} selected</button></div>
+    ${list.length ? `<div class="mgrid">${list.map(m => `<div class="mcard ${MD.sel.has(m.id) ? 'picked' : ''}" data-mid="${m.id}"><label class="mpick" onclick="event.stopPropagation()"><input type="checkbox" ${MD.sel.has(m.id) ? 'checked' : ''} onchange="mdToggle(${m.id},this.checked)"></label><div class="img" onclick="mediaDetail(${m.id})">${mthumb(m)}</div>
+      <div class="cap" onclick="mediaDetail(${m.id})"><div class="ell b">${esc(m.name)}</div><div class="tiny muted">${m.kind}${m.width ? ` · ${m.width}×${m.height}` : ''} · ${(m.size / 1048576).toFixed(1)} MB${m.used ? ` · used ${m.used}×` : ' · <b style="color:var(--brand)">new</b>'}</div></div></div>`).join('')}</div>
+      ${d.has_more ? `<div style="text-align:center" class="mt"><button class="btn" onclick="MD.shown+=200;PAGES.media.render($('#content'))">Show more (${d.total - d.media.length} more)</button></div>` : ''}` : emptyState('image', 'No media yet', 'Upload your photos and videos once — reuse them in any post.')}`;
   S.media = d.media;
+  MD.list = list;
   const dz = $('#dz');
   $('#mdFile').onchange = e => uploadFiles(e.target.files).then(() => PAGES.media.render(el));
   dz.ondragover = e => { e.preventDefault(); dz.classList.add('on'); };
@@ -493,18 +546,51 @@ PAGES.media = {title: 'Media library', sub: 'Every image and video, reusable in 
   dz.ondrop = e => { e.preventDefault(); dz.classList.remove('on'); uploadFiles(e.dataTransfer.files).then(() => PAGES.media.render(el)); };
 }};
 const debouncedMedia = debounce(() => PAGES.media.render($('#content')), 300);
+function mdToggle(id, on) { on ? MD.sel.add(id) : MD.sel.delete(id); const c = $(`.mcard[data-mid="${id}"]`); if (c) c.classList.toggle('picked', on); const b = $$('#content .btn.pri.sm').find(x => x.textContent.includes('selected')); if (b) { b.disabled = !MD.sel.size; b.innerHTML = `${ic('cal', 14)}Schedule ${MD.sel.size || ''} selected`; } }
+function mdSelectAll() { const all = MD.list.every(m => MD.sel.has(m.id)); MD.list.forEach(m => all ? MD.sel.delete(m.id) : MD.sel.add(m.id)); PAGES.media.render($('#content')); }
+// uploads: one file per request, 3 at the same time, each with its own progress — a bad file never stops the others
+function uploadOne(f, onProgress) {
+  return new Promise(res => {
+    const fd = new FormData(); fd.append('files', f);
+    const x = new XMLHttpRequest();
+    x.open('POST', '/api/media'); x.setRequestHeader('X-PP', '1');
+    x.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    x.onload = () => { let d = {}; try { d = JSON.parse(x.responseText); } catch (e) { /* not json */ } res(x.status < 300 ? {media: d.media || [], errors: d.errors || []} : {media: [], errors: [d.error || `${f.name}: upload failed (${x.status})`]}); };
+    x.onerror = () => res({media: [], errors: [`${f.name}: PostPilot is not reachable`]});
+    x.send(fd);
+  });
+}
 async function uploadFiles(files) {
-  if (!files || !files.length) return [];
-  const fd = new FormData();
-  [...files].forEach(f => fd.append('files', f));
-  const t = document.createElement('div'); t.className = 'toast'; t.innerHTML = `<span class="spin"></span><div>Uploading ${files.length} file(s)…</div>`; $('#toasts').appendChild(t);
-  try {
-    const r = await api('/api/media', {form: fd});
-    r.errors.forEach(e => toast(e, 'err'));
-    if (r.media.length) toast(`${r.media.length} file(s) added`, 'ok');
-    return r.media;
-  } catch (e) { toast(e.message, 'err'); return []; }
-  finally { t.remove(); }
+  files = [...(files || [])];
+  if (!files.length) return [];
+  const box = document.createElement('div'); box.className = 'toast upbox';
+  $('#toasts').appendChild(box);
+  const prog = files.map(() => 0), state = files.map(() => 'wait');
+  const total = files.reduce((a, f) => a + f.size, 0) || 1;
+  const draw = () => {
+    const sent = files.reduce((a, f, i) => a + f.size * prog[i], 0), done = state.filter(s => s === 'ok' || s === 'err').length;
+    box.innerHTML = `<div style="flex:1;min-width:0"><div class="row nw"><span class="spin"></span><b>Uploading ${done}/${files.length}</b><span class="sp"></span><span class="tiny">${Math.round(sent / total * 100)}%</span></div>
+      <div class="upbar"><i style="width:${(sent / total * 100).toFixed(1)}%"></i></div>
+      <div class="uplist">${files.map((f, i) => state[i] === 'up' ? `<div class="tiny ell">${esc(f.name)} · ${Math.round(prog[i] * 100)}%</div>` : '').join('')}</div></div>`;
+  };
+  const out = [], errs = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < files.length) {
+      const i = next++;
+      state[i] = 'up'; draw();
+      const r = await uploadOne(files[i], p => { prog[i] = p; draw(); });
+      prog[i] = 1; state[i] = r.errors.length ? 'err' : 'ok';
+      out.push(...r.media); errs.push(...r.errors); draw();
+    }
+  };
+  draw();
+  await Promise.all([worker(), worker(), worker()]);
+  box.remove();
+  errs.slice(0, 5).forEach(e => toast(e, 'err'));
+  if (errs.length > 5) toast(`${errs.length - 5} more file(s) could not be added`, 'err');
+  if (out.length) toast(`${out.length} file(s) added`, 'ok');
+  return out;
 }
 function mediaDetail(id) {
   const m = S.media.find(x => x.id === id);

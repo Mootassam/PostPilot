@@ -12,7 +12,9 @@ import mimetypes
 import os
 import secrets
 import shutil
+import queue
 import subprocess
+import threading
 
 from PIL import Image, ImageOps
 
@@ -112,7 +114,32 @@ def backfill_thumbs() -> int:
     return n
 
 
-def save_file(src_path: str, name: str, brand_id: int, move: bool = False) -> dict:
+# video posters are made by ONE background worker: uploading 100 videos never waits for ffmpeg
+_thumb_q: "queue.Queue[int]" = queue.Queue()
+_thumb_started = []
+
+
+def _thumb_worker() -> None:
+    while True:
+        mid = _thumb_q.get()
+        try:
+            m = store.one("SELECT * FROM media WHERE id=?", (mid,))
+            if m:
+                ensure_thumb(m)
+        except Exception:  # noqa: BLE001 - a poster is a nice-to-have
+            pass
+        finally:
+            _thumb_q.task_done()
+
+
+def thumb_later(mid: int) -> None:
+    if not _thumb_started:
+        _thumb_started.append(threading.Thread(target=_thumb_worker, daemon=True, name="thumbs"))
+        _thumb_started[0].start()
+    _thumb_q.put(mid)
+
+
+def save_file(src_path: str, name: str, brand_id: int, move: bool = False, thumb_async: bool = False) -> dict:
     """Store a file in the library and return the media row."""
     ext = os.path.splitext(name)[1].lower() or ".bin"
     dest = os.path.join(media_dir(), secrets.token_hex(10) + ext)
@@ -132,12 +159,14 @@ def save_file(src_path: str, name: str, brand_id: int, move: bool = False) -> di
         except Exception as e:  # noqa: BLE001
             os.remove(dest)
             raise ValueError(f"“{name}” is not a valid image ({e}).") from None
-    elif kind == "video":
+    elif kind == "video" and not thumb_async:
         thumb = video_thumb(dest)
     mid = store.execute("INSERT INTO media(brand_id,name,path,kind,mime,size,width,height,thumb,token,created_at)"
                         " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                         (brand_id, name[:200], dest, kind, mime, os.path.getsize(dest), w, h, thumb,
                          secrets.token_urlsafe(16), store.now()))
+    if kind == "video" and thumb_async:
+        thumb_later(mid)
     return store.one("SELECT * FROM media WHERE id=?", (mid,))
 
 
@@ -150,6 +179,19 @@ def out(m: dict) -> dict:
     d["poster"] = f"/media/{m['id']}/thumb" if has_thumb and m["kind"] == "video" else ""
     d["tags"] = store.jl(m.get("tags"))
     return d
+
+
+def usage_counts(brand_id: int | None = None) -> dict[int, int]:
+    """How many posts use each media file — one pass over the posts (instead of one search per file)."""
+    counts: dict[int, int] = {}
+    q = "SELECT media FROM posts WHERE media<>'[]'" + (" AND brand_id=?" if brand_id else "")
+    for r in store.rows(q, (brand_id,) if brand_id else ()):
+        for i in set(store.jl(r["media"])):
+            try:
+                counts[int(i)] = counts.get(int(i), 0) + 1
+            except (TypeError, ValueError):
+                pass
+    return counts
 
 
 def delete(mid: int) -> None:

@@ -118,6 +118,20 @@ CREATE TABLE IF NOT EXISTS activity(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, level TEXT, kind TEXT, text TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_act ON activity(ts);
+
+-- 1.3: every brand has its own developer apps (YouTube client, Meta app, X keys...) - fully isolated
+CREATE TABLE IF NOT EXISTS brand_apps(
+  brand_id INTEGER NOT NULL, network TEXT NOT NULL, creds TEXT, updated_at INTEGER,
+  PRIMARY KEY(brand_id, network)
+);
+-- 1.3: indexes for hundreds of posts / videos
+CREATE INDEX IF NOT EXISTS ix_posts_brand ON posts(brand_id, status, scheduled_at);
+CREATE INDEX IF NOT EXISTS ix_targets_acc ON targets(account_id, status);
+CREATE INDEX IF NOT EXISTS ix_targets_due ON targets(status, next_try_at);
+CREATE INDEX IF NOT EXISTS ix_accounts_brand ON accounts(brand_id);
+CREATE INDEX IF NOT EXISTS ix_media_brand ON media(brand_id, id);
+CREATE INDEX IF NOT EXISTS ix_inbox_acc ON inbox(account_id, status);
+CREATE INDEX IF NOT EXISTS ix_act_level ON activity(level, id);
 """
 
 # columns added after 1.0 — applied to existing databases on start
@@ -151,7 +165,16 @@ DEFAULTS = {
     "inbox_every_min": 10,
     "native_schedule": 1,      # hand scheduled posts to YouTube / Facebook early so they go out even with the PC off
 }
-INT_KEYS = {"brand_id", "retry_max", "notify", "health_hour", "inbox_every_min", "native_schedule"}
+INT_KEYS = {"brand_id", "retry_max", "notify", "health_hour", "inbox_every_min", "native_schedule", "parallel", "video_parallel"}
+DEFAULTS.update({
+    "parallel": 4,             # posts published at the same time (always different accounts)
+    "video_parallel": 2,       # of those, big video uploads at the same time (protects your internet + memory)
+})
+# settings each brand keeps for itself (falls back to the global value until the brand changes it)
+BRAND_KEYS = ("default_slots", "utm_source", "utm_medium", "utm_campaign", "x_plan", "native_schedule")
+
+# goes up on every change: the UI only re-draws a page when something really changed
+REV = [0]
 
 
 def now() -> int:
@@ -165,6 +188,9 @@ def conn() -> sqlite3.Connection:
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA busy_timeout=30000")
+        c.execute("PRAGMA synchronous=NORMAL")      # safe with WAL, much faster for many small writes
+        c.execute("PRAGMA temp_store=MEMORY")
+        c.execute("PRAGMA cache_size=-16000")       # 16 MB page cache per connection
         _local.c, _local.path = c, DB_PATH
     return c
 
@@ -183,6 +209,7 @@ def init(path: str | None = None) -> None:
                 if name not in have:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         c.commit()
+        _migrate_brand_apps(c)
         if not one("SELECT 1 FROM brands LIMIT 1"):
             bid = execute("INSERT INTO brands(name,color,created_at) VALUES(?,?,?)", ("My Brand", "#6d5dfc", now()))
             set("brand_id", bid)
@@ -195,6 +222,19 @@ def init(path: str | None = None) -> None:
                 execute("INSERT INTO templates(brand_id,name,text) VALUES(?,?,?)", (bid, name, text))
         # anything that was mid-publish when the app stopped goes back to the queue
         execute("UPDATE targets SET status='pending' WHERE status='publishing'")
+
+
+def _migrate_brand_apps(c) -> None:
+    """1.3: developer apps used to be shared by all brands. Every brand that existed then gets its own copy
+    (nothing that works today breaks); brands created later start empty = isolated."""
+    if c.execute("SELECT value FROM settings WHERE key='brand_apps_v1'").fetchone():
+        return
+    legacy = c.execute("SELECT network, creds FROM apps").fetchall()
+    for (bid,) in c.execute("SELECT id FROM brands").fetchall():
+        for net_key, creds in legacy:
+            c.execute("INSERT OR IGNORE INTO brand_apps(brand_id,network,creds,updated_at) VALUES(?,?,?,?)", (bid, net_key, creds, now()))
+    c.execute("INSERT INTO settings(key,value) VALUES('brand_apps_v1','1') ON CONFLICT(key) DO UPDATE SET value='1'")
+    c.commit()
 
 
 def rows(sql: str, args=()) -> list[dict]:
@@ -216,6 +256,7 @@ def execute(sql: str, args=()) -> int:
         c = conn()
         cur = c.execute(sql, args)
         c.commit()
+        REV[0] += 1
         return cur.lastrowid
 
 
@@ -225,6 +266,8 @@ def update(sql: str, args=()) -> int:
         c = conn()
         cur = c.execute(sql, args)
         c.commit()
+        if cur.rowcount:
+            REV[0] += 1
         return cur.rowcount
 
 
@@ -233,6 +276,28 @@ def executemany(sql: str, seq) -> None:
         c = conn()
         c.executemany(sql, seq)
         c.commit()
+        REV[0] += 1
+
+
+class transaction:
+    """Many writes as ONE commit (bulk scheduling hundreds of posts):  with store.transaction() as c: c.execute(...)"""
+
+    def __enter__(self):
+        _lock.acquire()
+        self.c = conn()
+        self.c.execute("BEGIN")
+        return self.c
+
+    def __exit__(self, et, ev, tb):
+        try:
+            if et:
+                self.c.rollback()
+            else:
+                self.c.commit()
+                REV[0] += 1
+        finally:
+            _lock.release()
+        return False
 
 
 # ---------------------------------------------------------------- settings
@@ -250,6 +315,31 @@ def get(key: str):
 def set(key: str, value) -> None:  # noqa: A001
     execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, "" if value is None else str(value)))
+
+
+def bget(brand_id, key: str):
+    """A brand's own value for a BRAND_KEYS setting, else the global one."""
+    if brand_id and key in BRAND_KEYS:
+        r = one("SELECT value FROM settings WHERE key=?", (f"b{int(brand_id)}:{key}",))
+        if r and r["value"] not in (None, ""):
+            v = r["value"]
+            if key in INT_KEYS:
+                try:
+                    return int(float(v))
+                except (TypeError, ValueError):
+                    return get(key)
+            return v
+    return get(key)
+
+
+def bset(brand_id, key: str, value) -> None:
+    if key not in BRAND_KEYS:
+        raise ValueError(f"{key} is not a brand setting")
+    set(f"b{int(brand_id)}:{key}", value)
+
+
+def brand_of_account(account: dict | None) -> int:
+    return int((account or {}).get("brand_id") or 0)
 
 
 def get_secret(key: str) -> str:
@@ -286,14 +376,29 @@ def save_creds(account_id: int, creds: dict) -> None:
     execute("UPDATE accounts SET creds=?, updated_at=? WHERE id=?", (vault.encrypt(json.dumps(creds)), now(), account_id))
 
 
-def app_creds(network: str) -> dict:
-    r = one("SELECT creds FROM apps WHERE network=?", (network,))
-    return jd(vault.decrypt(r["creds"])) if r else {}
+def app_creds(network: str, brand_id: int | None = None) -> dict:
+    """A brand's developer app for one app key (meta, youtube, x...). Every brand has its own (default: current brand)."""
+    if brand_id is None:
+        brand_id = get("brand_id")
+    r = one("SELECT creds FROM brand_apps WHERE brand_id=? AND network=?", (int(brand_id or 0), network))
+    return jd(vault.decrypt(r["creds"])) if r and r["creds"] else {}
 
 
-def set_app_creds(network: str, creds: dict) -> None:
-    execute("INSERT INTO apps(network,creds) VALUES(?,?) ON CONFLICT(network) DO UPDATE SET creds=excluded.creds",
-            (network, vault.encrypt(json.dumps(creds))))
+def set_app_creds(network: str, creds: dict, brand_id: int | None = None) -> None:
+    if brand_id is None:
+        brand_id = get("brand_id")
+    execute("INSERT INTO brand_apps(brand_id,network,creds,updated_at) VALUES(?,?,?,?) ON CONFLICT(brand_id,network)"
+            " DO UPDATE SET creds=excluded.creds, updated_at=excluded.updated_at",
+            (int(brand_id), network, vault.encrypt(json.dumps(creds)), now()))
+
+
+def account_app(account: dict, app_key: str) -> dict:
+    """The developer app an account was connected with (stored with its login), else its brand's app.
+    So changing one brand's keys never breaks the logins of another brand."""
+    own = creds_of(account).get("_app")
+    if isinstance(own, dict) and own:
+        return own
+    return app_creds(app_key, brand_of_account(account))
 
 
 def local_dt(ts: int) -> datetime:

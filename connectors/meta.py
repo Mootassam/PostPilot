@@ -84,7 +84,7 @@ class _Meta(Connector):
         if not tok:
             raise PublishError("Paste a user access token, or use “Log in with Meta”.")
         from store import app_creds
-        return _discover(_exchange_long(app_creds("meta"), tok))
+        return _discover(_exchange_long(data.get("_app") or app_creds("meta"), tok))
 
     def _comment(self, obj_id: str, token: str, text: str) -> None:
         if text:

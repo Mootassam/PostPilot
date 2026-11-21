@@ -33,7 +33,9 @@ Each connector uses the network's **official API** with keys you create. The ste
 - **Media**: automatic per-network resizing/conversion (e.g. Instagram aspect ratio, Bluesky ≤ 1 MB). Instagram/Threads media is served through a temporary secure Cloudflare link only while posting.
 - **Ideas board** (kanban), **Media library**, **Analytics** (likes, comments, shares, views per network, top posts, best-time heat map).
 - **Automation**: RSS/blog auto-posting, CSV bulk scheduling, recurring posts.
-- **Brands/workspaces** for clients, backup and restore, dark mode, encrypted logins (Windows DPAPI).
+- **Brands/workspaces, fully isolated (1.3)**: every brand has its own developer apps (YouTube client ID/secret, Meta app, X keys, LinkedIn, Pinterest…), its own accounts, posting times, UTM tags, X plan and "publish by itself" switch. Each account keeps the app it logged in with, so changing one brand's keys never breaks another. Settings → Brand, with "copy app keys from another brand".
+- **Built for hundreds of posts (1.3)**: bulk scheduling (one post per file, caption/title templates with `{name}`, queue slots or an even spread, max per day), bulk actions on posts (delete, move to drafts, retry, publish now, move times), fair publishing (one busy account never holds up the others), configurable parallel publishing + video upload lanes, resumable YouTube uploads (a dropped connection continues where it stopped), paged lists, uploads one file at a time with progress, video posters made in the background, and a UI that only redraws when something changed.
+- Backup and restore, dark mode, encrypted logins (Windows DPAPI).
 
 ## Run
 
